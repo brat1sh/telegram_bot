@@ -3,8 +3,9 @@
 
 Скрипт читает публичную веб-версию канала (https://t.me/s/cek_info),
 находит посты с ID больше сохранённого в last_seen_id.txt, проверяет их
-на ключевые слова очереди и при совпадении отправляет уведомление
-в личные сообщения через Telegram Bot API (метод sendMessage).
+на ключевые слова очереди и на экстренные отключения по своему городу,
+а при совпадении отправляет уведомление в личные сообщения через
+Telegram Bot API (метод sendMessage).
 
 Требуемые переменные окружения:
     BOT_TOKEN — токен бота от @BotFather
@@ -14,6 +15,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -41,7 +43,18 @@ KEYWORDS = (
     "1–2",
 )
 
+# Экстренные отключения касаются всего города, а не отдельной очереди,
+# поэтому у них своё правило: слово «екстрен» И упоминание своего города.
+# Канал пишет такие посты по разным городам, иначе придут чужие.
+EMERGENCY_KEYWORDS = ("екстрен", "экстрен", "аварійн", "аварийн")
+CITY_NAME = "Жовті Води"
+CITY_PATTERNS = (
+    r"жовт\w*\s+вод\w*",   # ЖОВТІ ВОДИ, у Жовтих Водах, мешканцям Жовтих Вод...
+    r"желт\w*\s+вод\w*",   # ЖЕЛТЫЕ ВОДЫ (русское написание)
+)
+
 MESSAGE_TITLE = "⚡️ Возможное отключение для 1.2 очереди"
+EMERGENCY_TITLE = f"⚡️ Экстренное отключение — {CITY_NAME}"
 
 HTTP_TIMEOUT = 30          # секунд на запрос к t.me
 TELEGRAM_TIMEOUT = 30      # секунд на запрос к Telegram API
@@ -69,6 +82,14 @@ class Post:
     @property
     def url(self) -> str:
         return POST_URL_TEMPLATE.format(post_id=self.post_id)
+
+
+@dataclass
+class Match:
+    """Почему пост признан важным и с каким заголовком его отправлять."""
+
+    title: str
+    reason: str
 
 
 # --- Вспомогательные функции ----------------------------------------------
@@ -183,19 +204,32 @@ def parse_posts(html: str) -> list[Post]:
     return sorted(posts.values(), key=lambda post: post.post_id)
 
 
-def match_keywords(text: str) -> str | None:
-    """Возвращает первое найденное ключевое слово или None."""
+def find_match(text: str) -> Match | None:
+    """Решает, нужно ли отправлять этот пост, и с каким заголовком.
+
+    1. Упоминание очереди 1.2 — отправляем всегда.
+    2. Экстренное отключение — только если в посте есть ваш город.
+    """
     haystack = text.casefold()
+
     for keyword in KEYWORDS:
         if keyword.casefold() in haystack:
-            return keyword
+            return Match(title=MESSAGE_TITLE, reason=f"очередь «{keyword}»")
+
+    if any(word in haystack for word in EMERGENCY_KEYWORDS):
+        if any(re.search(pattern, haystack) for pattern in CITY_PATTERNS):
+            return Match(
+                title=EMERGENCY_TITLE,
+                reason=f"экстренное отключение, {CITY_NAME}",
+            )
+
     return None
 
 
-def build_message(post: Post) -> str:
+def build_message(post: Post, title: str = MESSAGE_TITLE) -> str:
     """Формирует текст уведомления: заголовок, текст поста, ссылка."""
-    message = f"{MESSAGE_TITLE}\n\n{post.text}\n\n{post.url}" if post.text else (
-        f"{MESSAGE_TITLE}\n\n{post.url}"
+    message = f"{title}\n\n{post.text}\n\n{post.url}" if post.text else (
+        f"{title}\n\n{post.url}"
     )
 
     if len(message) <= MAX_MESSAGE_LEN:
@@ -203,7 +237,7 @@ def build_message(post: Post) -> str:
 
     # Обрезаем только в крайнем случае: Telegram не примет длиннее 4096.
     tail = f"\n\n{post.url}"
-    head = f"{MESSAGE_TITLE}\n\n"
+    head = f"{title}\n\n"
     keep = MAX_MESSAGE_LEN - len(head) - len(tail) - len("\n…")
     trimmed = post.text[: max(keep, 0)].rstrip()
     return f"{head}{trimmed}\n…{tail}"
@@ -312,14 +346,14 @@ def main() -> int:
     failed_ids: list[int] = []
 
     for post in new_posts:
-        keyword = match_keywords(post.text)
-        if keyword is None:
+        match = find_match(post.text)
+        if match is None:
             continue
 
-        ok, error = send_telegram(token, chat_id, build_message(post))
+        ok, error = send_telegram(token, chat_id, build_message(post, match.title))
         if ok:
             sent += 1
-            log(f"Уведомление отправлено: пост {post.post_id} (совпадение «{keyword}»).")
+            log(f"Уведомление отправлено: пост {post.post_id} ({match.reason}).")
         else:
             failed_ids.append(post.post_id)
             log(

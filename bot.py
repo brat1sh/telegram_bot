@@ -71,6 +71,7 @@ ANY_CITY_PATTERN = re.compile(
 #   «Графік на 17 ЛИСТОПАДА», «Зміни в черзі 1.2 на 17 ЛИСТОПАДА»,
 #   «Екстрені відключення — Жовті Води».
 QUEUE_NAME = "1.2"
+HEADER_ICON = "⚡️"
 HEADER_SCHEDULE = "Графік"
 HEADER_CHANGES = f"Зміни в черзі {QUEUE_NAME}"
 HEADER_SCHEDULE_CANCELLED = "Скасування графіка"
@@ -316,12 +317,12 @@ def build_header(post: Post, match: Match) -> str:
             header = HEADER_SCHEDULE
 
         date = extract_date(post.text)
-        return f"{header} на {date}" if date else header
+        return f"{HEADER_ICON} {header} на {date}" if date else f"{HEADER_ICON} {header}"
 
     header = HEADER_EMERGENCY_CANCELLED if cancelled else HEADER_EMERGENCY
 
     scope = CITY_NAME if match.kind == "emergency_city" else "вся область"
-    return f"{header} — {scope}"
+    return f"{HEADER_ICON} {header} — {scope}"
 
 
 def build_message(post: Post, title: str = "") -> str:

@@ -67,7 +67,7 @@ ANY_CITY_PATTERN = re.compile(
     r"(?:м\.|міст[оаі]|город[ае]?)\s*[А-ЯІЇЄҐA-Z]", re.IGNORECASE
 )
 
-MESSAGE_TITLE = "⚡️ Возможное отключение для 1.2 очереди"
+MESSAGE_TITLE = ""  # пустая строка = сообщение начинается сразу с текста поста
 EMERGENCY_TITLE = f"⚡️ Экстренное отключение — {CITY_NAME}"
 EMERGENCY_REGION_TITLE = "⚡️ Экстренное отключение — вся область"
 
@@ -259,19 +259,18 @@ def find_match(text: str) -> Match | None:
 
 
 def build_message(post: Post, title: str = MESSAGE_TITLE) -> str:
-    """Формирует текст уведомления: заголовок, текст поста, ссылка."""
-    message = f"{title}\n\n{post.text}\n\n{post.url}" if post.text else (
-        f"{title}\n\n{post.url}"
-    )
+    """Формирует текст уведомления: заголовок (если задан), текст поста, ссылка."""
+    body = post.text or ""
+    message = "\n\n".join(part for part in (title, body, post.url) if part)
 
     if len(message) <= MAX_MESSAGE_LEN:
         return message
 
     # Обрезаем только в крайнем случае: Telegram не примет длиннее 4096.
     tail = f"\n\n{post.url}"
-    head = f"{title}\n\n"
+    head = f"{title}\n\n" if title else ""
     keep = MAX_MESSAGE_LEN - len(head) - len(tail) - len("\n…")
-    trimmed = post.text[: max(keep, 0)].rstrip()
+    trimmed = body[: max(keep, 0)].rstrip()
     return f"{head}{trimmed}\n…{tail}"
 
 

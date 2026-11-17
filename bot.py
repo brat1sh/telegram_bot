@@ -9,7 +9,7 @@ Telegram Bot API (метод sendMessage).
 
 Требуемые переменные окружения:
     BOT_TOKEN — токен бота от @BotFather
-    CHAT_ID   — ваш личный Telegram ID
+    CHAT_ID   — ID получателей через запятую: личный ID и/или ID канала
 """
 
 from __future__ import annotations
@@ -396,13 +396,23 @@ def send_telegram(token: str, chat_id: str, text: str) -> tuple[bool, str | None
 # --- Основная логика -------------------------------------------------------
 
 
+def parse_chat_ids(raw: str) -> list[str]:
+    """Разбирает список получателей: «123456789,-1001234567890».
+
+    Один человек, канал или несколько адресов через запятую.
+    """
+    ids = [part.strip() for part in raw.split(",")]
+    return [chat_id for chat_id in ids if chat_id]
+
+
 def main() -> int:
     token = (os.environ.get("BOT_TOKEN") or "").strip()
-    chat_id = (os.environ.get("CHAT_ID") or "").strip()
+    chat_ids = parse_chat_ids(os.environ.get("CHAT_ID") or "")
 
-    if not token or not chat_id:
+    if not token or not chat_ids:
         log("ОШИБКА: не заданы переменные окружения BOT_TOKEN и/или CHAT_ID.")
         log("Задайте их в GitHub: Settings -> Secrets and variables -> Actions.")
+        log("В CHAT_ID можно перечислить нескольких получателей через запятую.")
         return 1
 
     try:
@@ -449,15 +459,25 @@ def main() -> int:
             continue
 
         header = build_header(post, match)
-        ok, error = send_telegram(token, chat_id, build_message(post, header))
-        if ok:
+        message = build_message(post, header)
+
+        errors: list[str] = []
+        for index, chat_id in enumerate(chat_ids, start=1):
+            ok, error = send_telegram(token, chat_id, message)
+            if not ok:
+                errors.append(f"получатель {index}: {redact(str(error))}")
+
+        if not errors:
             sent += 1
-            log(f"Уведомление отправлено: пост {post.post_id} ({match.reason}).")
+            log(
+                f"Уведомление отправлено: пост {post.post_id} "
+                f"({match.reason}), получателей: {len(chat_ids)}."
+            )
         else:
             failed_ids.append(post.post_id)
             log(
                 f"ОШИБКА отправки по посту {post.post_id}: "
-                f"{redact(str(error))}"
+                + "; ".join(errors)
             )
 
     log(f"Отправлено уведомлений: {sent}.")

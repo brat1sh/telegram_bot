@@ -1,0 +1,67 @@
+name: Check CEK outages (2)
+
+# Копия основного workflow со сдвинутым расписанием.
+# GitHub выполняет cron не строго по расписанию (на практике — около раза
+# в час на workflow), поэтому несколько копий со сдвигом дают больше проверок.
+# Состояние общее: last_seen_id.txt в репозитории, conflict-free concurrency.
+
+on:
+  schedule:
+    - cron: "2,7,12,17,22,27,32,37,42,47,52,57 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: check-cek-outages
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    name: Check @cek_info
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Check posts for outages
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: python bot.py
+
+      - name: Commit last_seen_id.txt
+        if: always()
+        run: |
+          set -e
+          if [ ! -f last_seen_id.txt ]; then
+            echo "last_seen_id.txt отсутствует — коммитить нечего."
+            exit 0
+          fi
+
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          git add -f last_seen_id.txt
+
+          if git diff --cached --quiet; then
+            echo "last_seen_id.txt не изменился."
+            exit 0
+          fi
+
+          git commit -m "Update last_seen_id.txt"
+          git push origin "HEAD:${GITHUB_REF_NAME}"

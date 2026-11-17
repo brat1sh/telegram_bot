@@ -53,8 +53,23 @@ CITY_PATTERNS = (
     r"желт\w*\s+вод\w*",   # ЖЕЛТЫЕ ВОДЫ (русское написание)
 )
 
+# Признаки того, что отключение объявлено на всю область, а не на город.
+REGION_PATTERNS = (
+    r"всій\s+області",
+    r"всієї\s+області",
+    r"по\s+всій\s+області",
+    r"в\s+межах\s+області",
+    r"дніпропетровськ\w*\s+област",
+)
+
+# Как в тексте выглядит упоминание любого города: «м. ДНІПРО», «для міста ...».
+ANY_CITY_PATTERN = re.compile(
+    r"(?:м\.|міст[оаі]|город[ае]?)\s*[А-ЯІЇЄҐA-Z]", re.IGNORECASE
+)
+
 MESSAGE_TITLE = "⚡️ Возможное отключение для 1.2 очереди"
 EMERGENCY_TITLE = f"⚡️ Экстренное отключение — {CITY_NAME}"
+EMERGENCY_REGION_TITLE = "⚡️ Экстренное отключение — вся область"
 
 HTTP_TIMEOUT = 30          # секунд на запрос к t.me
 TELEGRAM_TIMEOUT = 30      # секунд на запрос к Telegram API
@@ -208,7 +223,8 @@ def find_match(text: str) -> Match | None:
     """Решает, нужно ли отправлять этот пост, и с каким заголовком.
 
     1. Упоминание очереди 1.2 — отправляем всегда.
-    2. Экстренное отключение — только если в посте есть ваш город.
+    2. Экстренное отключение: свой город, вся область или пост без города.
+    3. Экстренное отключение по чужому городу — пропускаем.
     """
     haystack = text.casefold()
 
@@ -216,13 +232,29 @@ def find_match(text: str) -> Match | None:
         if keyword.casefold() in haystack:
             return Match(title=MESSAGE_TITLE, reason=f"очередь «{keyword}»")
 
-    if any(word in haystack for word in EMERGENCY_KEYWORDS):
-        if any(re.search(pattern, haystack) for pattern in CITY_PATTERNS):
-            return Match(
-                title=EMERGENCY_TITLE,
-                reason=f"экстренное отключение, {CITY_NAME}",
-            )
+    if not any(word in haystack for word in EMERGENCY_KEYWORDS):
+        return None
 
+    if any(re.search(pattern, haystack) for pattern in CITY_PATTERNS):
+        return Match(
+            title=EMERGENCY_TITLE,
+            reason=f"экстренное отключение, {CITY_NAME}",
+        )
+
+    if any(re.search(pattern, haystack) for pattern in REGION_PATTERNS):
+        return Match(
+            title=EMERGENCY_REGION_TITLE,
+            reason="экстренное отключение по всей области",
+        )
+
+    # Город в тексте не назван вообще — значит, объявление общее.
+    if not ANY_CITY_PATTERN.search(text):
+        return Match(
+            title=EMERGENCY_REGION_TITLE,
+            reason="экстренное отключение без указания города (общее)",
+        )
+
+    # Экстренное отключение по чужому городу — не наше дело.
     return None
 
 

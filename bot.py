@@ -67,9 +67,42 @@ ANY_CITY_PATTERN = re.compile(
     r"(?:м\.|міст[оаі]|город[ае]?)\s*[А-ЯІЇЄҐA-Z]", re.IGNORECASE
 )
 
-MESSAGE_TITLE = ""  # пустая строка = сообщение начинается сразу с текста поста
-EMERGENCY_TITLE = f"⚡️ Экстренное отключение — {CITY_NAME}"
-EMERGENCY_REGION_TITLE = "⚡️ Экстренное отключение — вся область"
+# Заголовок каждого сообщения собирается из текста поста:
+#   «Графік на 17 ЛИСТОПАДА», «Зміни в черзі 1.2 на 17 ЛИСТОПАДА»,
+#   «Екстрені відключення — Жовті Води».
+QUEUE_NAME = "1.2"
+HEADER_SCHEDULE = "Графік"
+HEADER_CHANGES = f"Зміни в черзі {QUEUE_NAME}"
+HEADER_SCHEDULE_CANCELLED = "Скасування графіка"
+HEADER_EMERGENCY = "Екстрені відключення"
+HEADER_EMERGENCY_CANCELLED = "Скасування екстрених відключень"
+
+# Первые символы поста описывают суть объявления, дальше идёт сам график.
+HEADLINE_CHARS = 250
+
+# Основы слов, означающих отмену: «скасування», «скасовуються», «скасовано».
+CANCELLED_STEMS = ("скасуван", "скасов")
+
+# Именно слово «зміни»/«змін», а не «змінюватися» в конце поста.
+CHANGES_PATTERN = re.compile(r"\bзмін(?:и|ах|ами|ам|ою)?\b")
+
+MONTHS_GENITIVE = (
+    "січня",
+    "лютого",
+    "березня",
+    "квітня",
+    "травня",
+    "червня",
+    "липня",
+    "серпня",
+    "вересня",
+    "жовтня",
+    "листопада",
+    "грудня",
+)
+DATE_PATTERN = re.compile(
+    r"(\d{1,2})\s+(" + "|".join(MONTHS_GENITIVE) + r")", re.IGNORECASE
+)
 
 HTTP_TIMEOUT = 30          # секунд на запрос к t.me
 TELEGRAM_TIMEOUT = 30      # секунд на запрос к Telegram API
@@ -101,9 +134,12 @@ class Post:
 
 @dataclass
 class Match:
-    """Почему пост признан важным и с каким заголовком его отправлять."""
+    """Почему пост признан важным.
 
-    title: str
+    kind: "queue" | "emergency_city" | "emergency_region".
+    """
+
+    kind: str
     reason: str
 
 
@@ -220,7 +256,7 @@ def parse_posts(html: str) -> list[Post]:
 
 
 def find_match(text: str) -> Match | None:
-    """Решает, нужно ли отправлять этот пост, и с каким заголовком.
+    """Решает, нужно ли отправлять этот пост, и почему.
 
     1. Упоминание очереди 1.2 — отправляем всегда.
     2. Экстренное отключение: свой город, вся область или пост без города.
@@ -230,27 +266,27 @@ def find_match(text: str) -> Match | None:
 
     for keyword in KEYWORDS:
         if keyword.casefold() in haystack:
-            return Match(title=MESSAGE_TITLE, reason=f"очередь «{keyword}»")
+            return Match(kind="queue", reason=f"очередь «{keyword}»")
 
     if not any(word in haystack for word in EMERGENCY_KEYWORDS):
         return None
 
     if any(re.search(pattern, haystack) for pattern in CITY_PATTERNS):
         return Match(
-            title=EMERGENCY_TITLE,
+            kind="emergency_city",
             reason=f"экстренное отключение, {CITY_NAME}",
         )
 
     if any(re.search(pattern, haystack) for pattern in REGION_PATTERNS):
         return Match(
-            title=EMERGENCY_REGION_TITLE,
+            kind="emergency_region",
             reason="экстренное отключение по всей области",
         )
 
     # Город в тексте не назван вообще — значит, объявление общее.
     if not ANY_CITY_PATTERN.search(text):
         return Match(
-            title=EMERGENCY_REGION_TITLE,
+            kind="emergency_region",
             reason="экстренное отключение без указания города (общее)",
         )
 
@@ -258,7 +294,37 @@ def find_match(text: str) -> Match | None:
     return None
 
 
-def build_message(post: Post, title: str = MESSAGE_TITLE) -> str:
+def extract_date(text: str) -> str | None:
+    """Достаёт дату из поста: «17 ЛИСТОПАДА» или None."""
+    match = DATE_PATTERN.search(text[:HEADLINE_CHARS]) or DATE_PATTERN.search(text)
+    if match is None:
+        return None
+    return f"{match.group(1)} {match.group(2).upper()}"
+
+
+def build_header(post: Post, match: Match) -> str:
+    """Собирает короткую шапку сообщения: тип события + дата."""
+    headline = post.text[:HEADLINE_CHARS].casefold()
+    cancelled = any(stem in headline for stem in CANCELLED_STEMS)
+
+    if match.kind == "queue":
+        if cancelled:
+            header = HEADER_SCHEDULE_CANCELLED
+        elif CHANGES_PATTERN.search(headline):
+            header = HEADER_CHANGES
+        else:
+            header = HEADER_SCHEDULE
+
+        date = extract_date(post.text)
+        return f"{header} на {date}" if date else header
+
+    header = HEADER_EMERGENCY_CANCELLED if cancelled else HEADER_EMERGENCY
+
+    scope = CITY_NAME if match.kind == "emergency_city" else "вся область"
+    return f"{header} — {scope}"
+
+
+def build_message(post: Post, title: str = "") -> str:
     """Формирует текст уведомления: заголовок (если задан), текст поста, ссылка."""
     body = post.text or ""
     message = "\n\n".join(part for part in (title, body, post.url) if part)
@@ -381,7 +447,8 @@ def main() -> int:
         if match is None:
             continue
 
-        ok, error = send_telegram(token, chat_id, build_message(post, match.title))
+        header = build_header(post, match)
+        ok, error = send_telegram(token, chat_id, build_message(post, header))
         if ok:
             sent += 1
             log(f"Уведомление отправлено: пост {post.post_id} ({match.reason}).")

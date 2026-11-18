@@ -1,18 +1,21 @@
 /**
- * Мониторинг канала @cek_info для очереди 1.2 (Cloudflare Worker).
+ * Мониторинг канала @cek_info для очереди 1.2 (Cloudflare Worker + Durable Object).
  *
- * Проверяет публичную страницу https://t.me/s/cek_info раз в минуту,
- * находит новые посты, фильтрует по очереди 1.2 и по экстренным
- * отключениям своего города, отправляет в Telegram.
+ * Почему Durable Object, а не KV: KV согласуется с задержкой до 60 секунд,
+ * поэтому следующий запуск мог прочитать старое состояние и отправить тот же
+ * пост повторно. Durable Object даёт строгую согласованность, а его запросы
+ * выполняются последовательно — гонок между запусками тоже нет.
  *
- * Секреты и настройки приходят из биндингов:
- *   BOT_TOKEN (secret), CHAT_ID (plain), STATE (KV namespace).
+ * Режимы (GET ?mode=...):
+ *   check  — обычная проверка (по умолчанию)
+ *   dry    — только показать, что было бы отправлено, без отправки и записи
+ *   status — состояние и журнал последних отправок
+ *   reset  — сбросить состояние (следующий запуск запомнит последний пост)
  */
 
 const CHANNEL = 'cek_info';
 const PAGE_URL = 'https://t.me/s/' + CHANNEL;
 const MARKER = 'data-post="' + CHANNEL + '/';
-const STATE_KEY = 'last_seen';
 
 const ICON = '⚡️';
 const QUEUE_NAME = '1.2';
@@ -22,8 +25,26 @@ const HEADER_SCHEDULE_CANCELLED = 'Скасування графіка';
 const HEADER_EMERGENCY = 'Екстрені відключення';
 const HEADER_EMERGENCY_CANCELLED = 'Скасування екстрених відключень';
 
-const KEYWORDS = ['1.2 черга', '1,2 черга', '1.2', '1,2', '1-2', '1–2'];
-const EMERGENCY_WORDS = ['екстрен', 'экстрен', 'аварійн', 'аварийн'];
+// Очередь ищется так, чтобы не ловить посторонние числа:
+// «1.2» / «1,2» — но не «1.25»; дефисные варианты — только рядом со словом «черга».
+const QUEUE_RES = [
+  /1[.,]2\s*черг/u,
+  /черг\p{L}*\s*1[.,]2/u,
+  /1[.,]2(?![\d])/u,
+  /1[-–]2\s*черг/u,
+  /черг\p{L}*\s*1[-–]2/u,
+];
+
+// Экстренное отключение — это объявление, а не любое упоминание слов.
+// Ловим только формулировки вида «застосовуються ЕКСТРЕНІ ВІДКЛЮЧЕННЯ»
+// или «скасування ЕКСТРЕНИХ ВІДКЛЮЧЕНЬ», чтобы не реагировать на посты
+// вроде «алгоритм дій під час екстрених відключень».
+const EMERGENCY_ACTION_RES = [
+  /(застосов|введен|впровадж|запровадж|скасуван|скасов|скасован|діють|тривають|почина|припин)\p{L}*[^.!?\n]{0,50}(екстрен|аварійн)\p{L}*\s+(відключен|обмежен|вимкнен)/u,
+  /(екстрен|аварійн)\p{L}*\s+(відключен|обмежен|вимкнен)\p{L}*[^.!?\n]{0,50}(застосов|введен|впровадж|запровадж|скасуван|скасов|скасован|діють|тривають|почина|припин)/u,
+];
+const EMERGENCY_PHRASE_RE = /(екстрен|аварійн)\p{L}*\s+(відключен|обмежен|вимкнен)/u;
+const EMERGENCY_HEADLINE_CHARS = 15;
 const CITY_NAME = 'Жовті Води';
 const CITY_RE = /жовт\p{L}*\s+вод\p{L}*|желт\p{L}*\s+вод\p{L}*/u;
 const REGION_RES = [
@@ -41,81 +62,120 @@ const HEADLINE_CHARS = 250;
 const CANCEL_STEMS = ['скасуван', 'скасов'];
 const CHANGES_RE = /змін(?:и|ах|ами|ам)/u;
 const MAX_LEN = 4000;
+const LOG_LIMIT = 20;
+
+export class Checker {
+  constructor(state, env) {
+    this.storage = state.storage;
+    this.env = env;
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    const mode = url.searchParams.get('mode') || 'check';
+
+    if (mode === 'status') {
+      const lastSeen = (await this.storage.get('last_seen')) || 0;
+      const log = (await this.storage.get('sent_log')) || [];
+      return Response.json({ ok: true, last_seen: lastSeen, sent_log: log });
+    }
+
+    if (mode === 'reset') {
+      await this.storage.delete('last_seen');
+      return Response.json({ ok: true, reset: true });
+    }
+
+    if (mode === 'selftest') {
+      return Response.json({ ok: true, results: selftest() });
+    }
+
+    const result = await this.check(mode);
+    return Response.json(result);
+  }
+
+  async check(mode) {
+    const res = await fetch(PAGE_URL, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+          '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'Accept-Language': 'uk,ru;q=0.9,en;q=0.8',
+      },
+    });
+    if (!res.ok) return { ok: false, error: 'HTTP ' + res.status };
+
+    const html = await res.text();
+    const positions = findPositions(html);
+    if (!positions.length) return { ok: false, error: 'посты не найдены' };
+
+    const newest = positions[positions.length - 1].id;
+    const stored = Number((await this.storage.get('last_seen')) || 0);
+
+    if (!stored && mode !== 'dry') {
+      await this.storage.put('last_seen', newest);
+      return { ok: true, first_run: true, newest };
+    }
+
+    const fresh = positions.filter((p) => p.id > stored);
+    if (!fresh.length) return { ok: true, newest, last_seen: stored, new_posts: 0 };
+
+    const sent = [];
+    const failed = [];
+
+    for (const pos of fresh) {
+      const post = { id: pos.id, text: extractText(html, pos.start, pos.end) };
+      const kind = findMatch(post.text);
+      if (!kind) continue;
+
+      const header = buildHeader(post.text, kind);
+      const text = buildMessage(post, header);
+
+      if (mode === 'dry') {
+        sent.push({ id: post.id, header, preview: text.slice(0, 120) });
+        continue;
+      }
+
+      const ok = await sendTelegram(this.env, text);
+      if (!ok) {
+        failed.push(post.id);
+        continue;
+      }
+
+      sent.push({ id: post.id, header });
+      const log = (await this.storage.get('sent_log')) || [];
+      log.push({ id: post.id, at: new Date().toISOString(), header });
+      await this.storage.put('sent_log', log.slice(-LOG_LIMIT));
+    }
+
+    if (mode !== 'dry') {
+      let target = newest;
+      if (failed.length) target = Math.min(...failed) - 1;
+      if (target > stored) await this.storage.put('last_seen', target);
+    }
+
+    return { ok: true, newest, last_seen: stored, new_posts: fresh.length, sent, failed };
+  }
+}
 
 export default {
-  async scheduled(controller, env, ctx) {
-    const result = await check(env);
-    console.log(JSON.stringify(result));
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(run(env, 'check'));
   },
 
   async fetch(request, env) {
     const url = new URL(request.url);
-    const mode = url.searchParams.get('mode') || 'check';
-    const result = await check(env, mode);
-    return Response.json(result);
+    const mode = url.searchParams.get('mode') || 'status';
+    return run(env, mode);
   },
 };
 
-async function check(env, mode = 'check') {
-  const res = await fetch(PAGE_URL, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-        '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-      'Accept-Language': 'uk,ru;q=0.9,en;q=0.8',
-    },
-  });
-  if (!res.ok) return { ok: false, error: 'HTTP ' + res.status };
-
-  const html = await res.text();
-  const positions = findPositions(html);
-  if (!positions.length) return { ok: false, error: 'посты не найдены' };
-
-  const newest = positions[positions.length - 1].id;
-  const stored = Number((await env.STATE.get(STATE_KEY)) || 0);
-
-  if (!stored && mode !== 'dry') {
-    await env.STATE.put(STATE_KEY, String(newest));
-    return { ok: true, first_run: true, newest };
+async function run(env, mode) {
+  const id = env.CHECKER.idFromName('cek');
+  const stub = env.CHECKER.get(id);
+  try {
+    return await stub.fetch('https://do/run?mode=' + encodeURIComponent(mode));
+  } catch (e) {
+    return Response.json({ ok: false, error: String(e) }, { status: 500 });
   }
-
-  const fresh = positions.filter((p) => p.id > stored);
-  if (!fresh.length) return { ok: true, newest, last_seen: stored, new_posts: 0 };
-
-  const sent = [];
-  const failed = [];
-
-  for (const pos of fresh) {
-    const post = { id: pos.id, text: extractText(html, pos.start, pos.end) };
-    const kind = findMatch(post.text);
-    if (!kind) continue;
-
-    const header = buildHeader(post.text, kind);
-    const text = buildMessage(post, header);
-
-    if (mode === 'dry') {
-      sent.push({ id: post.id, header, preview: text.slice(0, 120) });
-      continue;
-    }
-
-    const ok = await sendTelegram(env, text);
-    if (ok) sent.push({ id: post.id, header });
-    else failed.push(post.id);
-  }
-
-  if (mode !== 'dry') {
-    let target = newest;
-    if (failed.length) target = Math.min(...failed) - 1;
-    if (target > stored) await env.STATE.put(STATE_KEY, String(target));
-  }
-
-  return {
-    ok: true,
-    newest,
-    last_seen: stored,
-    new_posts: fresh.length,
-    sent,
-    failed,
-  };
 }
 
 function findPositions(html) {
@@ -134,7 +194,10 @@ function findPositions(html) {
   }
   found.sort((a, b) => a.id - b.id);
   for (let i = 0; i < found.length - 1; i++) found[i].end = found[i + 1].start;
-  if (found.length) found[found.length - 1].end = Math.min(html.length, found[found.length - 1].start + 20000);
+  if (found.length) {
+    const last = found[found.length - 1];
+    last.end = Math.min(html.length, last.start + 20000);
+  }
   return found;
 }
 
@@ -166,15 +229,42 @@ function unescapeHtml(s) {
 function findMatch(text) {
   const low = text.toLowerCase();
 
-  for (const keyword of KEYWORDS) {
-    if (low.includes(keyword.toLowerCase())) return 'queue';
-  }
+  if (QUEUE_RES.some((re) => re.test(low))) return 'queue';
 
-  if (!EMERGENCY_WORDS.some((w) => low.includes(w))) return null;
+  if (!isEmergencyAnnouncement(low)) return null;
   if (CITY_RE.test(low)) return 'emergency_city';
   if (REGION_RES.some((re) => re.test(low))) return 'emergency_region';
   if (!ANY_CITY_RE.test(text)) return 'emergency_region';
   return null;
+}
+
+function isEmergencyAnnouncement(low) {
+  // Либо рядом с фразой стоит действие, либо фраза открывает пост.
+  if (EMERGENCY_ACTION_RES.some((re) => re.test(low))) return true;
+  const idx = low.search(EMERGENCY_PHRASE_RE);
+  return idx !== -1 && idx < EMERGENCY_HEADLINE_CHARS;
+}
+
+// Проверка фильтров на типовых формулировках (?mode=selftest).
+const SELFTEST_CASES = [
+  ['🔹 Черга 1.2\n08:00-12:00', 'queue'],
+  ['1.2\n00:00-01:00', 'queue'],
+  ['Шановні споживачі м. ДНІПРО! Застосовуються ЕКСТРЕНІ ВІДКЛЮЧЕННЯ!', null],
+  ['Шановні мешканці м. ЖОВТІ ВОДИ! Застосовуються ЕКСТРЕНІ ВІДКЛЮЧЕННЯ!', 'emergency_city'],
+  ['м. Жовті Води: скасовуються ЕКСТРЕНІ відключення', 'emergency_city'],
+  ['Шановні споживачі! Застосовуються ЕКСТРЕНІ ВІДКЛЮЧЕННЯ!', 'emergency_region'],
+  ['Алгоритм дій. Можливі блекаути, екстрені відключення та аварійні ситуації.', null],
+  ['Увага! Екстрені відключення!', 'emergency_region'],
+  ['Протягом 1-2 годин подачу відновлять.', null],
+  ['черга 2.1 і 3.2', null],
+  ['Планові роботи у м. ЖОВТІ ВОДИ на 16 листопада', null],
+];
+
+function selftest() {
+  return SELFTEST_CASES.map(([text, expected]) => {
+    const got = findMatch(text);
+    return { text: text.split('\n')[0].slice(0, 60), expected, got, ok: got === expected };
+  });
 }
 
 function buildHeader(postText, kind) {
@@ -220,6 +310,6 @@ async function sendTelegram(env, text) {
   if (res.ok) return true;
 
   const body = await res.text();
-  console.log('telegram_error', res.status, body.slice(0, 300).replace(env.BOT_TOKEN, '<BOT_TOKEN>'));
+  console.log('telegram_error', res.status, body.slice(0, 300));
   return false;
 }

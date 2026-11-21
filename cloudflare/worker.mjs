@@ -64,6 +64,12 @@ const CHANGES_RE = /змін(?:и|ах|ами|ам)/u;
 const MAX_LEN = 4000;
 const LOG_LIMIT = 20;
 
+const PAGE_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+    '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+  'Accept-Language': 'uk,ru;q=0.9,en;q=0.8',
+};
+
 export class Checker {
   constructor(state, env) {
     this.storage = state.storage;
@@ -89,18 +95,22 @@ export class Checker {
       return Response.json({ ok: true, results: selftest() });
     }
 
+    if (mode === 'peek') {
+      const id = Number(url.searchParams.get('id') || 0);
+      const res = await fetch(PAGE_URL, { headers: PAGE_HEADERS });
+      if (!res.ok) return Response.json({ ok: false, error: 'HTTP ' + res.status });
+      const html = await res.text();
+      const pos = findPositions(html).find((p) => p.id === id);
+      if (!pos) return Response.json({ ok: false, error: 'пост не найден' });
+      return Response.json({ ok: true, id, text: extractText(html, pos.start, pos.end) });
+    }
+
     const result = await this.check(mode);
     return Response.json(result);
   }
 
   async check(mode) {
-    const res = await fetch(PAGE_URL, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-          '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-        'Accept-Language': 'uk,ru;q=0.9,en;q=0.8',
-      },
-    });
+    const res = await fetch(PAGE_URL, { headers: PAGE_HEADERS });
     if (!res.ok) return { ok: false, error: 'HTTP ' + res.status };
 
     const html = await res.text();
@@ -158,21 +168,21 @@ export class Checker {
 
 export default {
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(run(env, 'check'));
+    ctx.waitUntil(run(env, '?mode=check'));
   },
 
   async fetch(request, env) {
     const url = new URL(request.url);
-    const mode = url.searchParams.get('mode') || 'status';
-    return run(env, mode);
+    const search = url.search || '?mode=status';
+    return run(env, search);
   },
 };
 
-async function run(env, mode) {
+async function run(env, search) {
   const id = env.CHECKER.idFromName('cek');
   const stub = env.CHECKER.get(id);
   try {
-    return await stub.fetch('https://do/run?mode=' + encodeURIComponent(mode));
+    return await stub.fetch('https://do/run' + search);
   } catch (e) {
     return Response.json({ ok: false, error: String(e) }, { status: 500 });
   }
@@ -207,11 +217,20 @@ function extractText(html, start, end) {
   if (!m) return '';
   let s = m[1].replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '');
   s = unescapeHtml(s);
-  return s.split('\n')
-    .map((line) => line.trim())
-    .filter((line) => line.length)
-    .join('\n')
-    .trim();
+
+  // Сохраняем пустые строки: в исходном посте ими разделены абзацы.
+  // Несколько пустых строк подряд схлопываем в одну, края обрезаем.
+  const lines = [];
+  for (const raw of s.split('\n')) {
+    const line = raw.trim();
+    if (line === '') {
+      if (lines.length && lines[lines.length - 1] !== '') lines.push('');
+    } else {
+      lines.push(line);
+    }
+  }
+  while (lines.length && lines[lines.length - 1] === '') lines.pop();
+  return lines.join('\n');
 }
 
 function unescapeHtml(s) {

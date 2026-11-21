@@ -223,12 +223,23 @@ def fetch_html(url: str) -> str:
 
 
 def extract_text(node) -> str:
-    """Достаёт текст поста, превращая <br> в переводы строк."""
+    """Достаёт текст поста, сохраняя пустые строки между абзацами."""
     for br in node.find_all("br"):
         br.replace_with("\n")
 
-    lines = (line.strip() for line in node.get_text().splitlines())
-    return "\n".join(line for line in lines if line)
+    lines: list[str] = []
+    for raw in node.get_text().splitlines():
+        line = raw.strip()
+        if not line:
+            if lines and lines[-1]:
+                lines.append("")
+        else:
+            lines.append(line)
+
+    while lines and not lines[-1]:
+        lines.pop()
+
+    return "\n".join(lines)
 
 
 def parse_posts(html: str) -> list[Post]:
